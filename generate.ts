@@ -1,19 +1,8 @@
 import { basename, extname, join, relative, resolve } from "node:path";
-import { parseArgs } from "node:util";
 
 type YosysCell = { type: string; [k: string]: unknown };
-
-type YosysModule = {
-  attributes?: Record<string, string>;
-  cells?: Record<string, YosysCell>;
-  [k: string]: unknown;
-};
-
-type YosysNetlist = {
-  modules: Record<string, YosysModule>;
-  [k: string]: unknown;
-};
-
+type YosysModule = { cells?: Record<string, YosysCell>; [k: string]: unknown };
+type YosysNetlist = { modules: Record<string, YosysModule> };
 type ModuleEntry = {
   svg: string;
   json: string;
@@ -27,87 +16,77 @@ export type Manifest = {
   modules: Record<string, ModuleEntry>;
 };
 
-const viewDir = import.meta.dir;
-const repoRoot = resolve(viewDir, "..");
-const dataDir = join(viewDir, "data");
-const designPath = join(dataDir, "design.json");
-const manifestPath = join(dataDir, "manifest.json");
+export type GenerateOptions = {
+  rtl: string[];     // file paths or globs, resolved against `cwd`
+  top?: string;      // defaults to basename of first file
+  dataDir: string;   // where artifacts get written
+  cwd: string;       // base for relative paths + yosys/netlistsvg invocation
+};
 
-function fileStem(moduleName: string) {
-  return moduleName.replace(/[^A-Za-z0-9_.-]/g, "_");
-}
+const fileStem = (n: string) => n.replace(/[^A-Za-z0-9_.-]/g, "_");
 
-async function run(cmd: string[], label: string) {
-  const proc = Bun.spawn(cmd, { cwd: repoRoot, stdout: "pipe", stderr: "pipe" });
+async function run(cmd: string[], label: string, cwd: string) {
+  const proc = Bun.spawn(cmd, { cwd, stdout: "pipe", stderr: "pipe" });
   const [stdout, stderr, code] = await Promise.all([
     new Response(proc.stdout).text(),
     new Response(proc.stderr).text(),
     proc.exited,
   ]);
-
   if (code !== 0) {
     throw new Error(`${label} failed (exit ${code})\n${stderr || stdout}`.trim());
   }
 }
 
-async function discoverVerilog(): Promise<string[]> {
-  const files = await Array.fromAsync(
-    new Bun.Glob("src/rtl/**/*.{v,sv}").scan({ cwd: repoRoot, absolute: true }),
-  );
-  return files.sort();
-}
-
-async function detectTop(files: string[]): Promise<string> {
-  const config = Bun.file(join(repoRoot, "src/config_merged.json"));
-
-  if (await config.exists()) {
-    const { DESIGN_NAME } = (await config.json()) as { DESIGN_NAME?: string };
-    if (DESIGN_NAME) return DESIGN_NAME;
+async function expandGlobs(patterns: string[], cwd: string): Promise<string[]> {
+  const out: string[] = [];
+  for (const p of patterns) {
+    if (/[*?[]/.test(p)) {
+      out.push(...await Array.fromAsync(new Bun.Glob(p).scan({ cwd, absolute: true })));
+    } else {
+      out.push(resolve(cwd, p));
+    }
   }
-
-  const first = files[0];
-  if (!first) throw new Error("No Verilog sources found under src/rtl and none supplied.");
-  return basename(first, extname(first));
+  return [...new Set(out)].sort();
 }
 
-async function resetDataDir() {
-  await Bun.$`rm -rf ${dataDir}`.quiet();
-  await Bun.$`mkdir -p ${dataDir}`.quiet();
-}
-
-async function runYosys(files: string[], top: string) {
-  const quote = (s: string) => JSON.stringify(relative(repoRoot, s));
+async function runYosys(files: string[], top: string, cwd: string, designPath: string) {
+  const q = (s: string) => JSON.stringify(relative(cwd, s));
   const script = [
-    `read_verilog -sv ${files.map(quote).join(" ")}`,
+    `read_verilog -sv ${files.map(q).join(" ")}`,
     `prep -top ${top}`,
-    `write_json ${quote(designPath)}`,
+    `write_json ${q(designPath)}`,
   ].join("; ");
-
-  await run(["yosys", "-p", script], "yosys");
+  await run(["yosys", "-p", script], "yosys", cwd);
 }
 
-async function renderModule(name: string, mod: YosysModule) {
+async function renderModule(name: string, mod: YosysModule, dataDir: string, cwd: string) {
   const stem = fileStem(name);
   const jsonPath = join(dataDir, `${stem}.json`);
   const svgPath = join(dataDir, `${stem}.svg`);
-
-  const slice = { modules: { [name]: mod } };
-
-  await Bun.write(jsonPath, JSON.stringify(slice));
-  await run(["netlistsvg", jsonPath, "-o", svgPath], `netlistsvg ${name}`);
-
+  await Bun.write(jsonPath, JSON.stringify({ modules: { [name]: mod } }));
+  await run(["netlistsvg", jsonPath, "-o", svgPath], `netlistsvg ${name}`, cwd);
   return { name, json: `${stem}.json`, svg: `${stem}.svg` };
 }
 
-function buildManifest(
-  design: YosysNetlist,
-  top: string,
-  files: string[],
-  rendered: { name: string; json: string; svg: string }[],
-): Manifest {
+export async function generate(opts: GenerateOptions): Promise<Manifest> {
+  const files = await expandGlobs(opts.rtl, opts.cwd);
+  if (!files.length) throw new Error(`No Verilog files matched: ${opts.rtl.join(", ")}`);
+
+  const top = opts.top ?? basename(files[0], extname(files[0]));
+
+  await Bun.$`rm -rf ${opts.dataDir}`.quiet();
+  await Bun.$`mkdir -p ${opts.dataDir}`.quiet();
+
+  const designPath = join(opts.dataDir, "design.json");
+  await runYosys(files, top, opts.cwd, designPath);
+
+  const design = (await Bun.file(designPath).json()) as YosysNetlist;
+  const rendered = await Promise.all(
+    Object.entries(design.modules).map(([n, m]) => renderModule(n, m, opts.dataDir, opts.cwd)),
+  );
+
   const known = new Set(Object.keys(design.modules));
   const modules: Record<string, ModuleEntry> = {};
-
   for (const { name, json, svg } of rendered) {
     const cells = design.modules[name]?.cells ?? {};
     modules[name] = {
@@ -121,44 +100,12 @@ function buildManifest(
     };
   }
 
-  return {
+  const manifest: Manifest = {
     generatedAt: new Date().toISOString(),
     top,
-    sources: files.map((f) => relative(repoRoot, f)),
+    sources: files.map((f) => relative(opts.cwd, f)),
     modules,
   };
-}
-
-export async function generate(options: { top?: string; files?: string[] } = {}) {
-  await resetDataDir();
-
-  const files = options.files?.length ? options.files : await discoverVerilog();
-  if (!files.length) throw new Error("No Verilog input files.");
-
-  const top = options.top ?? (await detectTop(files));
-  await runYosys(files, top);
-
-  const design = (await Bun.file(designPath).json()) as YosysNetlist;
-  const rendered = await Promise.all(
-    Object.entries(design.modules).map(([name, mod]) => renderModule(name, mod)),
-  );
-
-  const manifest = buildManifest(design, top, files, rendered);
-  await Bun.write(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-
+  await Bun.write(join(opts.dataDir, "manifest.json"), `${JSON.stringify(manifest, null, 2)}\n`);
   return manifest;
-}
-
-if (import.meta.main) {
-  const { values, positionals } = parseArgs({
-    args: Bun.argv.slice(2),
-    options: { top: { type: "string" } },
-    allowPositionals: true,
-  });
-
-  const files = positionals.map((p) => resolve(repoRoot, p));
-  const manifest = await generate({ top: values.top, files });
-  console.log(
-    `wrote manifest (${Object.keys(manifest.modules).length} modules, top=${manifest.top})`,
-  );
 }
