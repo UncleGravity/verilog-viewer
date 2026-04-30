@@ -165,6 +165,8 @@ function App() {
             <CardContent className="flex-1 min-h-0">
               <Schematic
                 svgUrl={`${DATA}/${current.data.svg}`}
+                jsonUrl={`${DATA}/${current.data.json}`}
+                moduleName={current.name}
                 instances={current.data.instances}
                 onNavigate={descend}
               />

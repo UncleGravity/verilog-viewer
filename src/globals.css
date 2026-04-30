@@ -106,3 +106,47 @@
 .schematic .clickable-cell:hover rect {
   fill: #bfdbfe; /* blue-200 */
 }
+
+/* Hovered net: light up every segment + junction dot of the same wire. */
+.schematic .net-highlight {
+  stroke: #ef4444 !important; /* red-500 */
+  stroke-width: 2.5 !important;
+}
+
+.schematic circle.net-highlight {
+  fill: #ef4444 !important;
+}
+
+/* Multi-bit (bus) wires draw thicker than single nets so they're easy to spot. */
+.schematic line.bus,
+.schematic path.bus {
+  stroke-width: 3;
+}
+
+.schematic line.bus.net-highlight,
+.schematic path.bus.net-highlight {
+  stroke-width: 4 !important;
+}
+
+/* Top-level input / output ports get distinct fills so the design's
+   boundary signals stand out from internal logic. */
+.schematic .port-input path {
+  fill: #dcfce7; /* green-100 */
+  stroke: #16a34a; /* green-600 */
+  stroke-width: 1.5;
+}
+
+.schematic .port-input text {
+  fill: #14532d; /* green-900 */
+}
+
+.schematic .port-output path {
+  fill: #fef3c7; /* amber-100 */
+  stroke: #d97706; /* amber-600 */
+  stroke-width: 1.5;
+}
+
+.schematic .port-output text {
+  fill: #78350f; /* amber-900 */
+}
+

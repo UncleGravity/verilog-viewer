@@ -6,6 +6,8 @@ import type { Instance } from "@/types";
 
 type Props = {
   svgUrl: string;
+  jsonUrl: string;
+  moduleName: string;
   instances: Instance[];
   onNavigate: (moduleName: string) => void;
 };
@@ -17,11 +19,48 @@ const MAX_SCALE = 20;
 const DRAG_THRESHOLD_PX = 4;
 const ZOOM_STEP = 1.2;
 
-export function Schematic({ svgUrl, instances, onNavigate }: Props) {
+type YosysBit = number | string;
+type YosysPort = {
+  direction: "input" | "output" | "inout";
+  bits: YosysBit[];
+};
+type YosysCellEntry = {
+  type?: string;
+  connections?: Record<string, YosysBit[]>;
+};
+type YosysNetname = { hide_name: 0 | 1; bits: YosysBit[] };
+type YosysModule = {
+  ports?: Record<string, YosysPort>;
+  cells?: Record<string, YosysCellEntry>;
+  netnames?: Record<string, YosysNetname>;
+};
+type YosysNetlist = { modules: Record<string, YosysModule> };
+
+type SignalRef = {
+  name: string;
+  index: number;
+  width: number;
+  isPort: boolean;
+};
+
+type ModuleData = {
+  bitToSignal: Map<string, SignalRef>;
+  cellConnections: Map<string, Map<string, YosysBit[]>>;
+};
+
+export function Schematic({
+  svgUrl,
+  jsonUrl,
+  moduleName,
+  instances,
+  onNavigate,
+}: Props) {
   const outerRef = useRef<HTMLDivElement>(null);
   const innerRef = useRef<HTMLDivElement>(null);
+  const tooltipRef = useRef<HTMLDivElement>(null);
   const [svg, setSvg] = useState("");
   const [error, setError] = useState<string | null>(null);
+  const [moduleData, setModuleData] = useState<ModuleData | null>(null);
   const [view, setView] = useState<View>(IDENTITY);
 
   // Keep latest view in a ref so event handlers can read it without re-binding.
@@ -49,6 +88,22 @@ export function Schematic({ svgUrl, instances, onNavigate }: Props) {
     };
   }, [svgUrl]);
 
+  useEffect(() => {
+    let cancelled = false;
+    setModuleData(null);
+    fetch(jsonUrl)
+      .then((r) => r.json() as Promise<YosysNetlist>)
+      .then((y) => {
+        if (!cancelled) setModuleData(buildModuleData(y, moduleName));
+      })
+      .catch(() => {
+        // Tooltip/port-width info is optional; failure shouldn't break the view.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [jsonUrl, moduleName]);
+
   // Memoize the dangerouslySetInnerHTML object so React skips the prop update
   // when only the view (zoom/pan) changes. React 19 diffs this prop by
   // reference; a stable object means innerHTML is not reset on re-render, so
@@ -64,6 +119,25 @@ export function Schematic({ svgUrl, instances, onNavigate }: Props) {
       const txt = t.textContent ?? "";
       const pretty = prettyName(txt);
       if (pretty !== txt) t.textContent = pretty;
+    });
+
+    // Mark bus wires (multi-bit nets) so CSS can draw them thicker.
+    inner.querySelectorAll<SVGElement>('[class*="net_"]').forEach((el) => {
+      for (const c of el.classList) {
+        if (c.startsWith("net_") && c.includes(",")) {
+          el.classList.add("bus");
+          break;
+        }
+      }
+    });
+
+    // Tag top-level port cells so CSS can color them distinctly. Use a
+    // plain `g` query + getAttribute since attribute names with colons
+    // (the netlistsvg `s:` namespace) need awkward CSS escaping.
+    inner.querySelectorAll<SVGElement>("g").forEach((g) => {
+      const t = g.getAttribute("s:type");
+      if (t === "inputExt") g.classList.add("port-input");
+      else if (t === "outputExt") g.classList.add("port-output");
     });
 
     const moduleByCellId = new Map<string, string>();
@@ -87,6 +161,27 @@ export function Schematic({ svgUrl, instances, onNavigate }: Props) {
       }
     }
 
+    // Annotate port labels with bus widths from the netlist. This edits the
+    // existing label text in place (no overlays).
+    if (moduleData) {
+      inner
+        .querySelectorAll<SVGElement>('g[id^="port_"]')
+        .forEach((portG) => {
+          const id = portG.id; // port_<inst>~<port>
+          const sep = id.indexOf("~");
+          if (sep < 0) return;
+          const inst = id.slice("port_".length, sep);
+          const portName = id.slice(sep + 1);
+          const bits = moduleData.cellConnections.get(inst)?.get(portName);
+          if (!bits || bits.length <= 1) return;
+          const text = portG.querySelector("text");
+          if (!text) return;
+          const base = text.dataset.label ?? text.textContent ?? portName;
+          text.dataset.label = base;
+          text.textContent = `${base} [${bits.length}]`;
+        });
+    }
+
     const onCellClick = (e: MouseEvent) => {
       const cell = (e.target as Element | null)?.closest(".clickable-cell");
       if (!cell) return;
@@ -95,7 +190,84 @@ export function Schematic({ svgUrl, instances, onNavigate }: Props) {
     };
     inner.addEventListener("click", onCellClick);
     return () => inner.removeEventListener("click", onCellClick);
-  }, [svg, instances, onNavigate]);
+  }, [svg, instances, moduleData, onNavigate]);
+
+  // Highlight every segment of a net when hovering any one of its segments,
+  // and show a floating tooltip with the net's source-level name.
+  // netlistsvg labels each wire fragment (line/circle junction) with a
+  // `net_<id>` class shared across the whole net, so a single class lookup
+  // collects all geometry to light up.
+  useEffect(() => {
+    const inner = innerRef.current;
+    const tooltip = tooltipRef.current;
+    if (!inner || !svg) return;
+
+    let highlighted: Element[] = [];
+    let currentNet: string | null = null;
+
+    const netClassOf = (el: Element | null): string | null => {
+      if (!el || !el.classList) return null;
+      for (const c of el.classList) {
+        if (c.startsWith("net_")) return c;
+      }
+      return null;
+    };
+
+    const clear = () => {
+      for (const el of highlighted) el.classList.remove("net-highlight");
+      highlighted = [];
+      currentNet = null;
+      if (tooltip) tooltip.style.display = "none";
+    };
+
+    const positionTooltip = (clientX: number, clientY: number) => {
+      if (!tooltip) return;
+      tooltip.style.left = `${clientX + 12}px`;
+      tooltip.style.top = `${clientY + 12}px`;
+    };
+
+    const onOver = (e: MouseEvent) => {
+      const net = netClassOf(e.target as Element | null);
+      if (!net) return;
+      if (net !== currentNet) {
+        clear();
+        currentNet = net;
+        highlighted = Array.from(inner.getElementsByClassName(net));
+        for (const el of highlighted) el.classList.add("net-highlight");
+        if (tooltip) {
+          tooltip.textContent = moduleData
+            ? netLabel(net, moduleData)
+            : net.slice(4);
+          tooltip.style.display = "block";
+        }
+      }
+      positionTooltip(e.clientX, e.clientY);
+    };
+
+    const onMove = (e: MouseEvent) => {
+      if (currentNet) positionTooltip(e.clientX, e.clientY);
+    };
+
+    const onOut = (e: MouseEvent) => {
+      if (!currentNet) return;
+      const leaving = netClassOf(e.target as Element | null);
+      if (leaving !== currentNet) return;
+      // Stay highlighted if pointer moved onto another segment of the same net.
+      const entering = netClassOf(e.relatedTarget as Element | null);
+      if (entering === currentNet) return;
+      clear();
+    };
+
+    inner.addEventListener("mouseover", onOver);
+    inner.addEventListener("mousemove", onMove);
+    inner.addEventListener("mouseout", onOut);
+    return () => {
+      inner.removeEventListener("mouseover", onOver);
+      inner.removeEventListener("mousemove", onMove);
+      inner.removeEventListener("mouseout", onOut);
+      clear();
+    };
+  }, [svg, moduleData]);
 
   // Wheel zoom + drag pan. Stable handlers, fresh state via viewRef.
   useEffect(() => {
@@ -241,6 +413,10 @@ export function Schematic({ svgUrl, instances, onNavigate }: Props) {
         }}
         dangerouslySetInnerHTML={innerHtml}
       />
+      <div
+        ref={tooltipRef}
+        className="net-tooltip pointer-events-none fixed z-20 hidden rounded border bg-white px-2 py-1 font-mono text-xs shadow"
+      />
       <div className="absolute top-2 right-2 z-10 flex flex-col gap-1">
         <Button
           size="icon-sm"
@@ -288,3 +464,76 @@ function makeResponsive(svgText: string): string {
     return `<svg${next}>`;
   });
 }
+
+// Build per-bit signal lookup + per-instance connections from a one-module
+// Yosys netlist. We resolve names by priority: top-level ports, then
+// user-named nets, then synthesizer-generated nets.
+function buildModuleData(
+  yosys: YosysNetlist,
+  moduleName: string,
+): ModuleData | null {
+  const mod = yosys.modules?.[moduleName];
+  if (!mod) return null;
+  const bitToSignal = new Map<string, SignalRef>();
+  const apply = (name: string, bits: YosysBit[], isPort: boolean) => {
+    for (let i = 0; i < bits.length; i++) {
+      const k = String(bits[i]);
+      if (bitToSignal.has(k)) continue;
+      bitToSignal.set(k, { name, index: i, width: bits.length, isPort });
+    }
+  };
+  for (const [name, port] of Object.entries(mod.ports ?? {})) {
+    apply(name, port.bits, true);
+  }
+  const nets = Object.entries(mod.netnames ?? {});
+  for (const [name, n] of nets) if (n.hide_name === 0) apply(name, n.bits, false);
+  for (const [name, n] of nets) if (n.hide_name === 1) apply(name, n.bits, false);
+
+  const cellConnections = new Map<string, Map<string, YosysBit[]>>();
+  for (const [inst, cell] of Object.entries(mod.cells ?? {})) {
+    if (!cell.connections) continue;
+    cellConnections.set(inst, new Map(Object.entries(cell.connections)));
+  }
+  return { bitToSignal, cellConnections };
+}
+
+// Turn an SVG `net_<bits>` class into a human-readable label, matching the
+// bit list against the bitToSignal map. Returns the signal name (with index
+// or [hi:lo] when partial) or a generic fallback for constants / mixed nets.
+function netLabel(netClass: string, data: ModuleData): string {
+  const bitsStr = netClass.slice(4);
+  const bits = bitsStr.split(",");
+  const refs = bits.map((b) => data.bitToSignal.get(b));
+
+  if (refs.every((r) => r === undefined)) {
+    return bits.length === 1
+      ? `const '${bits[0]}'`
+      : `const ${bits.length}'b${bits.join("")}`;
+  }
+
+  const first = refs[0];
+  const same =
+    first &&
+    refs.every((r) => r && r.name === first.name && r.width === first.width);
+  if (!same) return `(${bits.length} bits)`;
+
+  const indices = refs.map((r) => r!.index);
+  const width = first!.width;
+  const name = first!.name;
+
+  if (indices.length === 1) {
+    return width === 1 ? name : `${name}[${indices[0]}]`;
+  }
+
+  const step = indices[1]! - indices[0]!;
+  const contiguous =
+    (step === 1 || step === -1) &&
+    indices.every((idx, i) => i === 0 || idx - indices[i - 1]! === step);
+  if (!contiguous) return `${name} (${indices.length} of ${width} bits)`;
+
+  const hi = Math.max(indices[0]!, indices[indices.length - 1]!);
+  const lo = Math.min(indices[0]!, indices[indices.length - 1]!);
+  if (lo === 0 && hi === width - 1) return `${name} [${width}]`;
+  return `${name}[${hi}:${lo}]`;
+}
+
