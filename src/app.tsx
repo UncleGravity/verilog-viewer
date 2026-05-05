@@ -72,7 +72,9 @@ function App() {
 
   if (error) {
     return (
-      <div className="p-8 text-destructive">Failed to load manifest: {error}</div>
+      <div className="p-8 text-destructive">
+        Failed to load manifest: {error}
+      </div>
     );
   }
 
@@ -88,7 +90,7 @@ function App() {
       <header className="flex h-14 items-center gap-3 border-b px-6 shrink-0">
         <div className="flex items-center gap-2 shrink-0">
           <Cpu className="size-5" />
-          <span className="font-semibold text-sm">tt-tpu viewer</span>
+          <span className="font-semibold text-sm">Verilog Viewer</span>
         </div>
         <Separator orientation="vertical" className="h-6" />
         <Button
@@ -151,10 +153,7 @@ function App() {
           <Card className="h-full flex flex-col py-4 gap-4">
             <CardHeader className="shrink-0">
               <div className="flex items-center gap-2 min-w-0">
-                <CardTitle
-                  className="font-mono truncate"
-                  title={current.name}
-                >
+                <CardTitle className="font-mono truncate" title={current.name}>
                   {prettyCurrent}
                 </CardTitle>
                 {current.name === manifest.top && (
